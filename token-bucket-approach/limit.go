@@ -19,9 +19,8 @@ func RateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler
 			w.WriteHeader(http.StatusTooManyRequests)
 			json.NewEncoder(w).Encode(&message)
 			return
-		} else {
+		} 
 			next(w, r)
-		}
-		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		
 	})
 }

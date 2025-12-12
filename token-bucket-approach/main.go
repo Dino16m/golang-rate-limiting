@@ -33,5 +33,5 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/ping", RateLimiter(responseHandler))
 
-	http.ListenAndServe(":8000", mux)
+	http.ListenAndServe(":9090", mux)
 }

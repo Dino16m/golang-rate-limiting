@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -10,36 +11,64 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type Visitors struct {
+type Visitor struct {
 	limiter  *rate.Limiter
-	mutex    sync.Mutex
 	lastSeen time.Time
 }
 
-func (v *Visitors) Seen(time time.Time) {
-	// This lock can be removed  since we only need minute level granularity
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-	v.lastSeen = time
+func (v *Visitor) Allow(now time.Time) bool {
+	v.lastSeen = now
+	return v.limiter.Allow()
+}
+
+
+type VisitorLimiter struct {
+	visitors map[string]*Visitor
+	ctx context.Context
+	mutex    sync.RWMutex
+}
+
+func newVisitorLimiter(ctx context.Context) *VisitorLimiter {
+	limiter := &VisitorLimiter{
+		visitors: make(map[string]*Visitor),
+		ctx: ctx,
+	}
+
+	go limiter.runEvictor()
+	return limiter
+}
+
+func (vl *VisitorLimiter) GetVisitor(fingerprint string, fallback *Visitor) *Visitor {
+	vl.mutex.RLock()
+	visitor, found := vl.visitors[fingerprint]
+	vl.mutex.RUnlock()
+	if !found {
+		vl.mutex.Lock()
+		vl.visitors[fingerprint] = fallback
+		defer vl.mutex.Unlock()
+	}
+	return visitor
+}
+
+func (vl *VisitorLimiter) runEvictor() {
+	for {
+		select {
+		case <- time.Tick(time.Minute):
+			for ip, visitor := range vl.visitors {
+			if time.Since(visitor.lastSeen) > 3*time.Minute {
+				vl.mutex.Lock()
+				delete(vl.visitors, ip)
+				vl.mutex.Unlock()
+			}
+		}
+		case <-vl.ctx.Done():
+			return
+		}
+	}
 }
 
 func PerClientRateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler {
-	var (
-		mutex    sync.RWMutex
-		visitors = make(map[string]*Visitors)
-	)
-
-	go func() {
-		for range time.Tick(time.Minute) {
-			for ip, visitor := range visitors {
-				if time.Since(visitor.lastSeen) > 3*time.Minute {
-					mutex.Lock()
-					delete(visitors, ip)
-					mutex.Unlock()
-				}
-			}
-		}
-	}()
+	visitorLimiter := newVisitorLimiter(context.Background())
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// get the client ip address
@@ -52,17 +81,8 @@ func PerClientRateLimiter(next func(w http.ResponseWriter, r *http.Request)) htt
 			)
 			return
 		}
-		mutex.RLock()
-		visitor, found := visitors[ip]
-		mutex.RUnlock()
-		if !found {
-			visitor = &Visitors{limiter: rate.NewLimiter(2, 4)}
-			mutex.Lock()
-			visitors[ip] = visitor
-			mutex.Unlock()
-		}
-		visitor.Seen(time.Now())
-		if !visitor.limiter.Allow() {
+		visitor := visitorLimiter.GetVisitor(ip, &Visitor{limiter: rate.NewLimiter(2, 4)})
+		if !visitor.Allow(time.Now()) {
 			message := Message{
 				Status: "Request failed",
 				Data:   "Too many request!, please try again later",
